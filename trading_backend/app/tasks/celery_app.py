@@ -1,7 +1,4 @@
 # app/tasks/celery_app.py
-import eventlet
-eventlet.monkey_patch() # <-- Add this line at the very top
-
 from celery import Celery
 from ..config import settings # Your application settings
 

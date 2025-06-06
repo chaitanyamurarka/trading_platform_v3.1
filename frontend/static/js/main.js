@@ -272,8 +272,16 @@ document.addEventListener('DOMContentLoaded', () => {
             if (candleSeries) candleSeries.setData(allChartData);
             if (volumeSeries) volumeSeries.setData(allVolumeData);
             
-            mainChart.timeScale().fitContent();
-
+            if (allChartData.length > 0) {
+                const dataSize = allChartData.length;
+                mainChart.timeScale().setVisibleLogicalRange({
+                    from: Math.max(0, dataSize - 100),
+                    to: dataSize - 1,
+                });
+            } else {
+                 mainChart.timeScale().fitContent();
+            }
+            
             updateDataSummary(allChartData.length > 0 ? allChartData[allChartData.length - 1] : null, token, exchange, interval);
             showToast(responseData.message, 'success');
 
