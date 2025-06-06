@@ -105,11 +105,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            // =================== FIX START ===================
-            // If all data is loaded, prevent scrolling before the first bar (index 0)
             if (allDataLoaded && newVisibleRange.from < 0) {
-                // This new logic prevents the jarring snap to the beginning.
-                // It preserves the user's zoom level and just stops the scroll at the boundary.
                 const currentRange = mainChart.timeScale().getVisibleLogicalRange();
                 if (currentRange) {
                     const rangeWidth = currentRange.to - currentRange.from;
@@ -120,7 +116,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 return;
             }
-            // =================== FIX END ===================
 
             if (currentlyFetching || !oldestDataTimestamp || allDataLoaded) {
                 return;
@@ -129,7 +124,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const lazyLoadThreshold = Math.max(50, Math.floor(allChartData.length * 0.05));
 
             if (newVisibleRange.from < lazyLoadThreshold) { 
-                const userSelectedStartDate = new Date(startTimeInput.value);
+                // =================== FIX START ===================
+                // Append 'Z' to the datetime-local string to interpret it as UTC, preventing timezone shifts.
+                const userSelectedStartDate = new Date(startTimeInput.value + 'Z');
+                // =================== FIX END ===================
+
                 const currentOldestDate = new Date(oldestDataTimestamp * 1000);
 
                 if (currentOldestDate <= userSelectedStartDate) {
