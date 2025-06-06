@@ -1,4 +1,4 @@
-# app/services/historical_data_service.py
+# chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-66a7995b817d40714564deabfdf0ca0ce8992874/trading_backend/app/services/historical_data_service.py
 from .. import pyiqfeed as iq
 from ..dtn_iq_client import get_iqfeed_history_conn, is_iqfeed_service_launched # Add is_iqfeed_service_launched
 
@@ -147,10 +147,7 @@ def fetch_from_dtn_iq_api(
 
                 filtered_timestamps_dt64 = timestamps_dt64[mask]
 
-                # =================== FIX IS HERE ===================
-                # Convert timestamps and make them timezone-aware (UTC)
                 python_timestamps = pd.to_datetime(filtered_timestamps_dt64, utc=True).to_pydatetime()
-                # ===================================================
 
                 open_prices = filtered_data['open_p'].astype(float)
                 high_prices = filtered_data['high_p'].astype(float)
@@ -200,7 +197,6 @@ def fetch_from_dtn_iq_api(
     
     return candles_from_iqfeed
 
-# ... INTERVAL_SECONDS_MAP can be defined here or imported from a config ...
 INTERVAL_SECONDS_MAP = {
     "1s": 1, "5s": 5, "10s": 10, "15s": 15, "30s": 30, "45s": 45,
     "1m": 60, "5m": 300, "10m": 600, "15m": 900,
@@ -215,57 +211,41 @@ def _get_and_prepare_1s_data_for_range(
     start_time: datetime,
     end_time: datetime
 ) -> List[schemas.CandleBase]:
-    """
-    Orchestrates fetching 1s data using a day-by-day caching strategy.
-    - Checks cache for each day in the requested range.
-    - Fetches any missing days from the DTN API in a single consolidated request.
-    - Caches the newly fetched data by day. If a day has no data, it's cached as an empty result.
-    - Combines all data and filters to the precise start/end time.
-    """
     all_1s_candles = []
-    
-    # Generate a list of date strings (YYYY-MM-DD) for the required range
     date_range = pd.date_range(start_time.date(), end_time.date())
     
-    # Use a Redis pipeline for efficient cache checking
-    pipe = redis_client.pipeline()
-    cache_keys_to_check = []
-    for day in date_range:
-        date_str = day.strftime('%Y-%m-%d')
-        cache_key = build_ohlc_cache_key(exchange, token, "1s", date_str, session_token=session_token)
-        cache_keys_to_check.append(cache_key)
-        pipe.get(cache_key)
+    cache_keys_to_check = [
+        build_ohlc_cache_key(exchange, token, "1s", day.strftime('%Y-%m-%d'), session_token=session_token)
+        for day in date_range
+    ]
     
-    cached_results = pipe.execute()
+    logging.info(f"Performing parallel cache check for {len(cache_keys_to_check)} keys.")
+    cached_results = redis_client.mget(cache_keys_to_check)
     
     missing_dates = []
     for i, result in enumerate(cached_results):
+        day = date_range[i].date()
         if result:
-            logging.info(f"Cache hit for 1s data on {date_range[i].date()}")
+            logging.debug(f"Cache hit for 1s data on {day}")
             try:
                 deserialized = json.loads(result)
-                # Ensure we don't extend with an empty marker if that's what was cached
-                if deserialized:
+                if deserialized: 
                     all_1s_candles.extend([schemas.CandleBase(**item) for item in deserialized])
             except (json.JSONDecodeError, TypeError):
-                logging.warning(f"Could not parse cached 1s data for {date_range[i].date()}. Refetching.")
-                missing_dates.append(date_range[i].date())
+                logging.warning(f"Could not parse cached 1s data for {day}. Refetching.")
+                missing_dates.append(day)
         else:
-            logging.info(f"Cache miss for 1s data on {date_range[i].date()}")
-            missing_dates.append(date_range[i].date())
+            logging.debug(f"Cache miss for 1s data on {day}")
+            missing_dates.append(day)
 
-    # Fetch missing data if any dates were not found in cache
     if missing_dates:
-        # Find the earliest and latest missing dates to fetch in one go
         fetch_start_date = min(missing_dates)
         fetch_end_date = max(missing_dates)
         
-        # Define the time range for the fetch API call
-        # Start of the first missing day to the end of the last missing day
         fetch_start_time = datetime.combine(fetch_start_date, datetime.min.time())
         fetch_end_time = datetime.combine(fetch_end_date, datetime.max.time())
 
-        logging.info(f"Fetching missing 1s data from DTN for range: {fetch_start_time} to {fetch_end_time}")
+        logging.info(f"Fetching missing 1s data from DTN for {len(missing_dates)} dates in range: {fetch_start_time} to {fetch_end_time}")
         
         newly_fetched_data = fetch_from_dtn_iq_api(
             trading_symbol=token,
@@ -274,11 +254,6 @@ def _get_and_prepare_1s_data_for_range(
             end_time=fetch_end_time
         )
         
-        # Start a new pipeline for caching the results
-        pipe = redis_client.pipeline()
-
-        # Group fetched data by date string for efficient lookup
-        grouped_new_data = {}
         if newly_fetched_data:
             all_1s_candles.extend(newly_fetched_data)
             new_data_df = pd.DataFrame([c.model_dump() for c in newly_fetched_data])
@@ -286,35 +261,31 @@ def _get_and_prepare_1s_data_for_range(
                 new_data_df['timestamp'] = pd.to_datetime(new_data_df['timestamp'])
                 new_data_df['date_key'] = new_data_df['timestamp'].dt.strftime('%Y-%m-%d')
                 grouped_new_data = {date_key: group for date_key, group in new_data_df.groupby('date_key')}
-
-        # Iterate through all dates we attempted to fetch to update the cache
-        for day in missing_dates:
-            date_str = day.strftime('%Y-%m-%d')
-            day_cache_key = build_ohlc_cache_key(exchange, token, "1s", date_str, session_token=session_token)
-            
-            if date_str in grouped_new_data:
-                # Data was found for this day, cache it
-                group = grouped_new_data[date_str]
-                serializable_group = group.to_dict(orient='records')
-                for record in serializable_group:
-                    if isinstance(record['timestamp'], pd.Timestamp):
-                        record['timestamp'] = record['timestamp'].to_pydatetime().isoformat()
                 
-                pipe.set(day_cache_key, json.dumps(serializable_group), ex=CACHE_EXPIRATION_SECONDS)
-                logging.info(f"Caching {len(group)} 1s records for date {date_str}")
-            else:
-                # No data was found for this specific day, cache an empty marker
-                pipe.set(day_cache_key, json.dumps([]), ex=CACHE_EXPIRATION_SECONDS)
-                logging.info(f"Caching empty result for date {date_str} as no data was returned.")
-        
-        # Execute all caching operations at once
-        pipe.execute()
+                logging.info(f"Queueing {len(missing_dates)} daily records into Redis pipeline for caching.")
+                pipe = redis_client.pipeline()
+                for day in missing_dates:
+                    date_str = day.strftime('%Y-%m-%d')
+                    day_cache_key = build_ohlc_cache_key(exchange, token, "1s", date_str, session_token=session_token)
+                    
+                    if date_str in grouped_new_data:
+                        group = grouped_new_data[date_str]
+                        # =================== FIX START ===================
+                        # Convert the DataFrame group to a list of dictionaries first
+                        records_to_cache = group.to_dict(orient='records')
+                        # Now, iterate through the list and convert the Timestamp object to a string
+                        for record in records_to_cache:
+                            record['timestamp'] = record['timestamp'].isoformat()
+                        # Now the list of dictionaries is fully JSON serializable
+                        pipe.set(day_cache_key, json.dumps(records_to_cache), ex=CACHE_EXPIRATION_SECONDS)
+                        # =================== FIX END ===================
+                    else:
+                        pipe.set(day_cache_key, json.dumps([]), ex=CACHE_EXPIRATION_SECONDS)
+                
+                pipe.execute()
+                logging.info("Redis pipeline execution complete.")
 
-    # Sort all candles by timestamp to ensure correct order before filtering
     all_1s_candles.sort(key=lambda c: c.timestamp)
-    
-    # Filter the combined list to the precise user-requested start and end times
-    # Ensure timezone awareness for comparison
     start_time_aware = start_time.replace(tzinfo=timezone.utc) if start_time.tzinfo is None else start_time
     end_time_aware = end_time.replace(tzinfo=timezone.utc) if end_time.tzinfo is None else end_time
     
@@ -324,53 +295,41 @@ def _get_and_prepare_1s_data_for_range(
 
     return final_filtered_candles
 
-# Make sure the original get_historical_data_with_fetch function is here,
-# as it calls the reworked helper function above. Its code does not need to change.
 def get_historical_data_with_fetch(
     background_tasks: BackgroundTasks,
     session_token: str,
     exchange: str,
     token: str,
-    interval_val: str, # User's desired interval
+    interval_val: str, 
     start_time: datetime,
     end_time: datetime
-) -> schemas.HistoricalDataResponse: # MODIFIED: Return type is now HistoricalDataResponse
+) -> schemas.HistoricalDataResponse: 
 
-    DATA_CAP = 5000 # Define the cap for the number of candles to return at once
+    DATA_CAP = 5000 
 
-    # 1. Check for a USER-SPECIFIC cache for the TARGET interval first.
-    query_range_str = f"{start_time.isoformat()}_{end_time.isoformat()}"
-    user_specific_cache_key = build_ohlc_cache_key(
-        exchange, token, interval_val, query_range_str, session_token=session_token
-    )
-    
     if interval_val != "1s":
+      query_range_str = f"{start_time.isoformat()}_{end_time.isoformat()}"
+      user_specific_cache_key = build_ohlc_cache_key(
+          exchange, token, interval_val, query_range_str, session_token=session_token
+      )
       cached_data = get_cached_ohlc_data(user_specific_cache_key)
       if cached_data:
           logging.info(f"Cache hit for aggregated {interval_val} data: {user_specific_cache_key}")
-          # ... existing cache filtering logic ...
-          
-          # Even from cache, we apply the new response logic
           total_available = len(cached_data)
           if total_available > DATA_CAP:
               candles_to_send = cached_data[-DATA_CAP:]
               return schemas.HistoricalDataResponse(
-                  candles=candles_to_send,
-                  total_available=total_available,
-                  is_partial=True,
+                  candles=candles_to_send, total_available=total_available, is_partial=True,
                   message=f"Partial data loaded from cache. Displaying last {len(candles_to_send)} of {total_available} candles."
               )
           else:
               return schemas.HistoricalDataResponse(
-                  candles=cached_data,
-                  total_available=total_available,
-                  is_partial=False,
+                  candles=cached_data, total_available=total_available, is_partial=False,
                   message=f"Full data with {total_available} candles loaded from cache."
               )
 
     logging.info(f"No user-specific cache for {interval_val}. Processing request for {exchange}:{token} ({start_time} - {end_time})")
 
-    # 2. Obtain 1-second base data
     base_1s_candles_for_resampling: List[schemas.CandleBase] = _get_and_prepare_1s_data_for_range(
         background_tasks, session_token, exchange, token, start_time, end_time
     )
@@ -379,26 +338,10 @@ def get_historical_data_with_fetch(
         logging.warning(f"No 1s base data found for {exchange}:{token} in range.")
         return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.")
 
-    # Determine the final list of candles (either 1s or resampled)
     final_candles: List[schemas.Candle]
     if interval_val == "1s":
         final_candles = [schemas.Candle(**c.model_dump()) for c in base_1s_candles_for_resampling]
     else:
-        # 3. Perform Numba/CUDA resampling
-        # ... (existing resampling logic is unchanged) ...
-        # The result of resampling is 'resampled_api_candles'
-        
-        # This part is just a placeholder for the actual resampling logic which is already correct.
-        # The output of that logic is what we call `final_candles`.
-        # For the purpose of this change, assume the resampling code runs and produces `resampled_api_candles`
-        # ...
-        # aggregation_seconds = INTERVAL_SECONDS_MAP[interval_val]
-        # ...
-        # (ts_agg, o_agg, h_agg, l_agg, c_agg, v_agg, num_agg_bars) = launch_resample_ohlc(...)
-        # ...
-        # final_candles = resampled_api_candles
-        # Let's assume the resampling code from your file is here and returns `resampled_api_candles`
-        # For brevity, I'll copy the relevant parts of the logic flow.
         aggregation_seconds = INTERVAL_SECONDS_MAP.get(interval_val)
         if not aggregation_seconds:
             raise HTTPException(status_code=400, detail=f"Unsupported interval for resampling: {interval_val}")
@@ -423,11 +366,14 @@ def get_historical_data_with_fetch(
                 open=o_agg[i], high=h_agg[i], low=l_agg[i], close=c_agg[i], volume=v_agg[i]
             ))
         final_candles = resampled_api_candles
-        # Cache the full resampled data for future requests of the same full range
-        set_cached_ohlc_data(user_specific_cache_key, final_candles)
+        
+        if interval_val != "1s":
+            query_range_str_for_caching = f"{start_time.isoformat()}_{end_time.isoformat()}"
+            cache_key_for_aggregated = build_ohlc_cache_key(
+                exchange, token, interval_val, query_range_str_for_caching, session_token=session_token
+            )
+            set_cached_ohlc_data(cache_key_for_aggregated, final_candles)
 
-
-    # 4. Apply capping logic and create the final response object
     total_available = len(final_candles)
     if total_available == 0:
         return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.")
