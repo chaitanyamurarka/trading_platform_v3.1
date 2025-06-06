@@ -1,4 +1,4 @@
-# chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-66a7995b817d40714564deabfdf0ca0ce8992874/trading_backend/app/services/historical_data_service.py
+# chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-fd71c9072644cabd20e39b57bf2d47b25107e752/trading_backend/app/services/historical_data_service.py
 from .. import pyiqfeed as iq
 from ..dtn_iq_client import get_iqfeed_history_conn, is_iqfeed_service_launched # Add is_iqfeed_service_launched
 
@@ -17,6 +17,7 @@ from ..core.cache import redis_client,CACHE_EXPIRATION_SECONDS
 from pydantic import TypeAdapter # Added for bulk Pydantic model creation
 from fastapi import BackgroundTasks,HTTPException # Add this import
 from sqlalchemy import text # Add for raw SQL if needed for other parts, though CRUD should handle most
+import uuid
 
 # import time # time module was imported but not used in the provided file, can be removed if not needed elsewhere
 def map_interval_to_iqfeed_params(interval_val: str) -> Optional[Dict[str, any]]:
@@ -295,101 +296,126 @@ def _get_and_prepare_1s_data_for_range(
 
     return final_filtered_candles
 
-def get_historical_data_with_fetch(
+def _process_and_cache_full_data(
     background_tasks: BackgroundTasks,
     session_token: str,
     exchange: str,
     token: str,
-    interval_val: str, 
+    interval_val: str,
     start_time: datetime,
     end_time: datetime
-) -> schemas.HistoricalDataResponse: 
-
-    DATA_CAP = 5000 
-
-    if interval_val != "1s":
-      query_range_str = f"{start_time.isoformat()}_{end_time.isoformat()}"
-      user_specific_cache_key = build_ohlc_cache_key(
-          exchange, token, interval_val, query_range_str, session_token=session_token
-      )
-      cached_data = get_cached_ohlc_data(user_specific_cache_key)
-      if cached_data:
-          logging.info(f"Cache hit for aggregated {interval_val} data: {user_specific_cache_key}")
-          total_available = len(cached_data)
-          if total_available > DATA_CAP:
-              candles_to_send = cached_data[-DATA_CAP:]
-              return schemas.HistoricalDataResponse(
-                  candles=candles_to_send, total_available=total_available, is_partial=True,
-                  message=f"Partial data loaded from cache. Displaying last {len(candles_to_send)} of {total_available} candles."
-              )
-          else:
-              return schemas.HistoricalDataResponse(
-                  candles=cached_data, total_available=total_available, is_partial=False,
-                  message=f"Full data with {total_available} candles loaded from cache."
-              )
-
-    logging.info(f"No user-specific cache for {interval_val}. Processing request for {exchange}:{token} ({start_time} - {end_time})")
-
-    base_1s_candles_for_resampling: List[schemas.CandleBase] = _get_and_prepare_1s_data_for_range(
+) -> Optional[str]:
+    """
+    Fetches, processes, and caches the ENTIRE dataset for a given range.
+    Returns the cache key (request_id) where the full data is stored.
+    """
+    base_1s_candles = _get_and_prepare_1s_data_for_range(
         background_tasks, session_token, exchange, token, start_time, end_time
     )
 
-    if not base_1s_candles_for_resampling:
-        logging.warning(f"No 1s base data found for {exchange}:{token} in range.")
-        return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.")
+    if not base_1s_candles:
+        logging.warning(f"No 1s base data found for {exchange}:{token} in range to process.")
+        return None
 
     final_candles: List[schemas.Candle]
     if interval_val == "1s":
-        final_candles = [schemas.Candle(**c.model_dump()) for c in base_1s_candles_for_resampling]
+        final_candles = [schemas.Candle(**c.model_dump()) for c in base_1s_candles]
     else:
         aggregation_seconds = INTERVAL_SECONDS_MAP.get(interval_val)
         if not aggregation_seconds:
             raise HTTPException(status_code=400, detail=f"Unsupported interval for resampling: {interval_val}")
 
-        timestamps_1s_np = np.array([c.timestamp.replace(tzinfo=timezone.utc).timestamp() for c in base_1s_candles_for_resampling], dtype=np.float64)
-        open_1s_np = np.array([c.open for c in base_1s_candles_for_resampling], dtype=np.float64)
-        high_1s_np = np.array([c.high for c in base_1s_candles_for_resampling], dtype=np.float64)
-        low_1s_np = np.array([c.low for c in base_1s_candles_for_resampling], dtype=np.float64)
-        close_1s_np = np.array([c.close for c in base_1s_candles_for_resampling], dtype=np.float64)
-        volume_1s_np = np.array([c.volume if c.volume is not None else 0.0 for c in base_1s_candles_for_resampling], dtype=np.float64)
+        # Prepare numpy arrays for Numba kernel
+        timestamps_1s_np = np.array([c.timestamp.replace(tzinfo=timezone.utc).timestamp() for c in base_1s_candles], dtype=np.float64)
+        open_1s_np = np.array([c.open for c in base_1s_candles], dtype=np.float64)
+        high_1s_np = np.array([c.high for c in base_1s_candles], dtype=np.float64)
+        low_1s_np = np.array([c.low for c in base_1s_candles], dtype=np.float64)
+        close_1s_np = np.array([c.close for c in base_1s_candles], dtype=np.float64)
+        volume_1s_np = np.array([c.volume if c.volume is not None else 0.0 for c in base_1s_candles], dtype=np.float64)
         
+        # Launch resampling
         (ts_agg, o_agg, h_agg, l_agg, c_agg, v_agg, num_agg_bars) = launch_resample_ohlc(
             timestamps_1s_np, open_1s_np, high_1s_np, low_1s_np, close_1s_np, volume_1s_np,
             aggregation_seconds
         )
 
-        resampled_api_candles: List[schemas.Candle] = []
+        resampled_candles: List[schemas.Candle] = []
         for i in range(num_agg_bars):
             agg_dt = datetime.fromtimestamp(ts_agg[i], tz=timezone.utc)
-            resampled_api_candles.append(schemas.Candle(
+            resampled_candles.append(schemas.Candle(
                 timestamp=agg_dt,
                 open=o_agg[i], high=h_agg[i], low=l_agg[i], close=c_agg[i], volume=v_agg[i]
             ))
-        final_candles = resampled_api_candles
+        final_candles = resampled_candles
+
+    if final_candles:
+        request_id = f"chart_data:{session_token}:{uuid.uuid4()}"
+        set_cached_ohlc_data(request_id, final_candles, expiration=3600)  # Cache for 1 hour
+        logging.info(f"Full dataset with {len(final_candles)} candles processed and cached with request_id: {request_id}")
+        return request_id
+    
+    return None
+
+def get_initial_historical_data(
+    background_tasks: BackgroundTasks,
+    session_token: str,
+    exchange: str,
+    token: str,
+    interval_val: str,
+    start_time: datetime,
+    end_time: datetime,
+    limit: int = 5000
+) -> schemas.HistoricalDataResponse:
+    
+    request_id = _process_and_cache_full_data(
+        background_tasks, session_token, exchange, token, interval_val, start_time, end_time
+    )
+
+    if not request_id:
+        return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.", request_id=None, offset=None)
+
+    full_data = get_cached_ohlc_data(request_id)
+    if not full_data:
+        return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="Error retrieving processed data from cache.", request_id=request_id, offset=None)
         
-        if interval_val != "1s":
-            query_range_str_for_caching = f"{start_time.isoformat()}_{end_time.isoformat()}"
-            cache_key_for_aggregated = build_ohlc_cache_key(
-                exchange, token, interval_val, query_range_str_for_caching, session_token=session_token
-            )
-            set_cached_ohlc_data(cache_key_for_aggregated, final_candles)
+    total_available = len(full_data)
+    initial_offset = max(0, total_available - limit)
+    
+    candles_to_send = full_data[initial_offset:] 
+    
+    return schemas.HistoricalDataResponse(
+        request_id=request_id,
+        candles=candles_to_send,
+        offset=initial_offset,
+        total_available=total_available,
+        is_partial=total_available > len(candles_to_send),
+        message=f"Initial data loaded. Displaying last {len(candles_to_send)} of {total_available} candles."
+    )
 
-    total_available = len(final_candles)
-    if total_available == 0:
-        return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.")
+def get_historical_data_chunk(
+    request_id: str,
+    offset: int,
+    limit: int = 5000
+) -> schemas.HistoricalDataChunkResponse:
+    
+    if not request_id.startswith("chart_data:"):
+        raise HTTPException(status_code=400, detail="Invalid request_id format.")
 
-    if total_available > DATA_CAP:
-        candles_to_send = final_candles[-DATA_CAP:]
-        return schemas.HistoricalDataResponse(
-            candles=candles_to_send,
-            total_available=total_available,
-            is_partial=True,
-            message=f"Partial data load. Displaying the most recent {len(candles_to_send)} of {total_available} total candles."
-        )
-    else:
-        return schemas.HistoricalDataResponse(
-            candles=final_candles,
-            total_available=total_available,
-            is_partial=False,
-            message=f"Complete data with {total_available} candles loaded."
-        )
+    full_data = get_cached_ohlc_data(request_id)
+
+    if full_data is None:
+        raise HTTPException(status_code=404, detail="Data for this request not found or has expired.")
+
+    total_available = len(full_data)
+    
+    if offset >= total_available:
+        return schemas.HistoricalDataChunkResponse(candles=[], offset=offset, limit=limit, total_available=total_available)
+        
+    chunk = full_data[offset : offset + limit]
+    
+    return schemas.HistoricalDataChunkResponse(
+        candles=chunk,
+        offset=offset,
+        limit=limit,
+        total_available=total_available
+    )

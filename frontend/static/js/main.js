@@ -1,4 +1,4 @@
-// chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-66a7995b817d40714564deabfdf0ca0ce8992874/frontend/static/js/main.js
+// chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-fd71c9072644cabd20e39b57bf2d47b25107e752/frontend/static/js/main.js
 document.addEventListener('DOMContentLoaded', () => {
     const chartContainer = document.getElementById('chartContainer');
     const loadChartBtn = document.getElementById('loadChartBtn');
@@ -14,16 +14,20 @@ document.addEventListener('DOMContentLoaded', () => {
     let allChartData = [];
     let allVolumeData = [];
     let currentlyFetching = false;
-    let oldestDataTimestamp = null;
-    let allDataLoaded = false; // Flag to track if all data is loaded
+    let allDataLoaded = false;
+
+    // New state variables for pagination
+    let chartRequestId = null;
+    let chartTotalAvailable = 0;
+    let chartCurrentOffset = 0;
+    const DATA_CHUNK_SIZE = 5000;
 
     let mainChart = null;
     let candleSeries = null;
     let volumeSeries = null;
-    let sessionToken = null; // To store the session token
-    let heartbeatIntervalId = null; // To store the interval ID for the heartbeat
+    let sessionToken = null;
+    let heartbeatIntervalId = null;
 
-    // Function to start the session and heartbeat
     async function startSession() {
         try {
             const sessionData = await initiateSession();
@@ -31,9 +35,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 sessionToken = sessionData.session_token;
                 console.log(`Session started with token: ${sessionToken}`);
                 showToast(`Session started.`, 'info');
-
                 if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
-
                 heartbeatIntervalId = setInterval(async () => {
                     if (sessionToken) {
                         try {
@@ -52,7 +54,6 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                     }
                 }, 60000);
-
             } else {
                 throw new Error("Invalid session data received from server.");
             }
@@ -65,188 +66,84 @@ document.addEventListener('DOMContentLoaded', () => {
     const getChartTheme = () => {
         const isDarkMode = document.documentElement.getAttribute('data-theme') === 'dark';
         return {
-            layout: {
-                background: { type: 'solid', color: isDarkMode ? '#1d232a' : '#ffffff' },
-                textColor: isDarkMode ? '#a6adba' : '#1f2937',
-                fontFamily: 'Inter, sans-serif',
-            },
-            grid: {
-                vertLines: { color: isDarkMode ? '#2a323c' : '#e5e7eb' },
-                horzLines: { color: isDarkMode ? '#2a323c' : '#e5e7eb' },
-            },
-            crosshair: {
-                mode: LightweightCharts.CrosshairMode.Normal,
-            },
-            rightPriceScale: {
-                borderColor: isDarkMode ? '#2a323c' : '#e5e7eb',
-            },
-            timeScale: {
-                borderColor: isDarkMode ? '#2a323c' : '#e5e7eb',
-                timeVisible: true,
-                secondsVisible: ['1s', '5s', '10s', '15s', '30s', '45s'].includes(intervalSelect.value),
-            },
+            layout: { background: { type: 'solid', color: isDarkMode ? '#1d232a' : '#ffffff' }, textColor: isDarkMode ? '#a6adba' : '#1f2937', fontFamily: 'Inter, sans-serif' },
+            grid: { vertLines: { color: isDarkMode ? '#2a323c' : '#e5e7eb' }, horzLines: { color: isDarkMode ? '#2a323c' : '#e5e7eb' } },
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+            rightPriceScale: { borderColor: isDarkMode ? '#2a323c' : '#e5e7eb' },
+            timeScale: { borderColor: isDarkMode ? '#2a323c' : '#e5e7eb', timeVisible: true, secondsVisible: ['1s', '5s', '10s', '15s', '30s', '45s'].includes(intervalSelect.value) },
         };
     };
     
     function initializeCharts() {
         if (mainChart) mainChart.remove();
         mainChart = LightweightCharts.createChart(chartContainer, getChartTheme());
-        candleSeries = mainChart.addSeries(LightweightCharts.CandlestickSeries, {
-            upColor: '#10b981', downColor: '#ef4444',
-            borderVisible: false, wickUpColor: '#10b981', wickDownColor: '#ef4444',
-        });
-        volumeSeries = mainChart.addSeries(LightweightCharts.HistogramSeries, {
-            color: '#9ca3af', priceFormat: { type: 'volume' }, priceScaleId: '', 
-        });
+        candleSeries = mainChart.addSeries(LightweightCharts.CandlestickSeries, { upColor: '#10b981', downColor: '#ef4444', borderVisible: false, wickUpColor: '#10b981', wickDownColor: '#ef4444' });
+        volumeSeries = mainChart.addSeries(LightweightCharts.HistogramSeries, { color: '#9ca3af', priceFormat: { type: 'volume' }, priceScaleId: '' });
         mainChart.priceScale('').applyOptions({ scaleMargins: { top: 0.7, bottom: 0 } });
 
         mainChart.timeScale().subscribeVisibleLogicalRangeChange(async (newVisibleRange) => {
-            if (!newVisibleRange) {
+            if (!newVisibleRange || currentlyFetching || allDataLoaded || !chartRequestId) {
                 return;
             }
 
-            if (allDataLoaded && newVisibleRange.from < 0) {
-                const currentRange = mainChart.timeScale().getVisibleLogicalRange();
-                if (currentRange) {
-                    const rangeWidth = currentRange.to - currentRange.from;
-                    mainChart.timeScale().setVisibleLogicalRange({
-                        from: 0,
-                        to: rangeWidth,
-                    });
-                }
-                return;
-            }
-
-            if (currentlyFetching || !oldestDataTimestamp || allDataLoaded) {
-                return;
-            }
-
-            const lazyLoadThreshold = Math.max(50, Math.floor(allChartData.length * 0.05));
-
-            if (newVisibleRange.from < lazyLoadThreshold) { 
-                // =================== FIX START ===================
-                // Append 'Z' to the datetime-local string to interpret it as UTC, preventing timezone shifts.
-                const userSelectedStartDate = new Date(startTimeInput.value + 'Z');
-                // =================== FIX END ===================
-
-                const currentOldestDate = new Date(oldestDataTimestamp * 1000);
-
-                if (currentOldestDate <= userSelectedStartDate) {
+            const lazyLoadThreshold = 10;
+            if (newVisibleRange.from < lazyLoadThreshold) {
+                const nextOffset = chartCurrentOffset - DATA_CHUNK_SIZE;
+                if (nextOffset < 0) {
                     allDataLoaded = true;
                     return;
                 }
-                
-                const nextStartTime = userSelectedStartDate;
-                const nextEndTime = new Date(currentOldestDate.getTime() - 1000);
-
-
-                if (nextStartTime >= nextEndTime) {
-                    allDataLoaded = true;
-                    return;
-                }
-
-                const nextStartTimeStr = nextStartTime.toISOString().slice(0, 16);
-                const nextEndTimeStr = nextEndTime.toISOString().slice(0, 16);
-                
-                showToast('Loading older data...', 'info');
-                await fetchAndApplyData(nextStartTimeStr, nextEndTimeStr, true);
+                await fetchAndPrependDataChunk(nextOffset);
             }
         });
     }
-
-    async function fetchAndApplyData(startTime, endTime, prepending = false) {
-        if (currentlyFetching) {
-            console.log("Already fetching data, please wait.");
-            return;
-        }
+    
+    async function fetchAndPrependDataChunk(offset) {
         currentlyFetching = true;
         if (loadingIndicator) loadingIndicator.style.display = 'flex';
+        showToast('Loading older data...', 'info');
 
-        const exchange = exchangeSelect.value;
-        const token = symbolSelect.value;
-        const interval = intervalSelect.value;
-
-        if (startTime.length === 16) startTime += ':00';
-        if (endTime.length === 16) endTime += ':00';
-
-        const apiUrl = getHistoricalDataUrl(sessionToken, exchange, token, interval, startTime, endTime);
+        const apiUrl = getHistoricalDataChunkUrl(chartRequestId, offset, DATA_CHUNK_SIZE);
 
         try {
             const response = await fetch(apiUrl);
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({ detail: response.statusText }));
-                throw new Error(`HTTP error ${response.status}: ${errorData.detail || 'Failed to fetch data'}`);
+                throw new Error(`HTTP error ${response.status}: ${errorData.detail || 'Failed to fetch chunk'}`);
             }
             
-            const responseData = await response.json();
-
-            if (!responseData || !Array.isArray(responseData.candles) || responseData.candles.length === 0) {
-                const message = responseData.message || 'No historical data available for this range.';
-                showToast(message, 'info');
-                if (prepending) {
-                    console.log("Lazy loading complete: No more older candles returned.");
-                    allDataLoaded = true;
-                }
+            const chunkData = await response.json(); // HistoricalDataChunkResponse
+            
+            if (!chunkData || !Array.isArray(chunkData.candles) || chunkData.candles.length === 0) {
+                allDataLoaded = true;
+                console.log("Lazy loading complete: No more older candles returned.");
                 return;
             }
 
-            if (prepending && !responseData.is_partial) {
-                console.log("Lazy loading complete: Server indicated end of data.");
+            const chartFormattedData = chunkData.candles.map(item => ({ time: item.unix_timestamp, open: item.open, high: item.high, low: item.low, close: item.close }));
+            const volumeFormattedData = chunkData.candles.map(item => ({ time: item.unix_timestamp, value: item.volume, color: item.close > item.open ? 'rgba(16, 185, 129, 0.5)' : 'rgba(239, 68, 68, 0.5)' }));
+
+            allChartData = [...chartFormattedData, ...allChartData];
+            allVolumeData = [...volumeFormattedData, ...allVolumeData];
+
+            chartCurrentOffset = chunkData.offset;
+            if (chartCurrentOffset === 0) {
                 allDataLoaded = true;
-            }
-
-            const candleData = responseData.candles;
-            const chartFormattedData = candleData.map(item => ({
-                time: item.unix_timestamp, open: item.open, high: item.high, low: item.low, close: item.close,
-            }));
-            const volumeFormattedData = candleData.map(item => ({
-                time: item.unix_timestamp, value: item.volume,
-                color: item.close > item.open ? 'rgba(16, 185, 129, 0.5)' : 'rgba(239, 68, 68, 0.5)',
-            }));
-
-            if (prepending) {
-                allChartData = [...chartFormattedData, ...allChartData];
-                allVolumeData = [...volumeFormattedData, ...allVolumeData];
-            } else {
-                allChartData = chartFormattedData;
-                allVolumeData = volumeFormattedData;
-                if (!responseData.is_partial) {
-                    allDataLoaded = true;
-                }
-            }
-            
-            if(chartFormattedData.length > 0) {
-                oldestDataTimestamp = chartFormattedData[0].time;
             }
 
             if (candleSeries) candleSeries.setData(allChartData);
             if (volumeSeries) volumeSeries.setData(allVolumeData);
-            
-            if (!prepending) {
-                const dataSize = allChartData.length;
-                if (dataSize > 0) {
-                    const numberOfBarsToShow = 100;
-                    const visibleFrom = Math.max(0, dataSize - numberOfBarsToShow);
-                    const visibleTo = dataSize - 1;
-                    mainChart.timeScale().setVisibleLogicalRange({ from: visibleFrom, to: visibleTo });
-                } else {
-                    mainChart.timeScale().fitContent();
-                }
-            }
 
-            updateDataSummary(allChartData.length > 0 ? allChartData[allChartData.length - 1] : null, token, exchange, interval);
-            showToast(`Chart data loaded. Total points: ${allChartData.length}`, 'success');
-
+            showToast(`Older data loaded. Total points: ${allChartData.length}`, 'success');
         } catch (error) {
-            console.error('Failed to fetch chart data:', error);
+            console.error('Failed to fetch older chart data:', error);
             showToast(`Error: ${error.message}`, 'error');
-            dataSummaryElement.textContent = `Error loading data: ${error.message}`;
         } finally {
             if (loadingIndicator) loadingIndicator.style.display = 'none';
             currentlyFetching = false;
         }
     }
-    
+
     function updateDataSummary(latestData, symbol, exchange, interval) {
         if (!latestData) {
             dataSummaryElement.innerHTML = 'No data to summarize.';
@@ -328,20 +225,72 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         
+        // Reset state for new chart load
         allDataLoaded = false;
         allChartData = [];
         allVolumeData = [];
-        oldestDataTimestamp = null;
+        chartRequestId = null;
+        chartTotalAvailable = 0;
+        chartCurrentOffset = 0;
+        currentlyFetching = true;
+        if (loadingIndicator) loadingIndicator.style.display = 'flex';
 
-        await fetchAndApplyData(startTimeStr, endTimeStr, false);
+        const exchange = exchangeSelect.value;
+        const token = symbolSelect.value;
+        const interval = intervalSelect.value;
+
+        const apiUrl = getHistoricalDataUrl(sessionToken, exchange, token, interval, startTimeStr, endTimeStr);
+
+        try {
+            const response = await fetch(apiUrl);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+                throw new Error(`HTTP error ${response.status}: ${errorData.detail || 'Failed to fetch data'}`);
+            }
+            
+            const responseData = await response.json(); // HistoricalDataResponse
+
+            if (!responseData || !responseData.request_id || !Array.isArray(responseData.candles) || responseData.candles.length === 0) {
+                const message = responseData.message || 'No historical data available for this range.';
+                showToast(message, 'info');
+                return;
+            }
+
+            // Store the new state from the initial response
+            chartRequestId = responseData.request_id;
+            chartTotalAvailable = responseData.total_available;
+            chartCurrentOffset = responseData.offset;
+
+            if (chartCurrentOffset === 0 && responseData.is_partial === false) {
+                 allDataLoaded = true;
+            }
+
+            const candleData = responseData.candles;
+            allChartData = candleData.map(item => ({ time: item.unix_timestamp, open: item.open, high: item.high, low: item.low, close: item.close }));
+            allVolumeData = candleData.map(item => ({ time: item.unix_timestamp, value: item.volume, color: item.close > item.open ? 'rgba(16, 185, 129, 0.5)' : 'rgba(239, 68, 68, 0.5)' }));
+            
+            if (candleSeries) candleSeries.setData(allChartData);
+            if (volumeSeries) volumeSeries.setData(allVolumeData);
+            
+            mainChart.timeScale().fitContent();
+
+            updateDataSummary(allChartData.length > 0 ? allChartData[allChartData.length - 1] : null, token, exchange, interval);
+            showToast(responseData.message, 'success');
+
+        } catch (error) {
+            console.error('Failed to fetch initial chart data:', error);
+            showToast(`Error: ${error.message}`, 'error');
+            dataSummaryElement.textContent = `Error loading data: ${error.message}`;
+        } finally {
+            if (loadingIndicator) loadingIndicator.style.display = 'none';
+            currentlyFetching = false;
+        }
     }
 
     loadChartBtn.addEventListener('click', loadInitialChart);
-
     window.addEventListener('resize', () => { if (mainChart) mainChart.resize(chartContainer.clientWidth, chartContainer.clientHeight); });
 
-    // --- Final Initialization Sequence ---
     setDefaultDateTime();
     initializeCharts();
-    startSession(); 
+    startSession();
 });

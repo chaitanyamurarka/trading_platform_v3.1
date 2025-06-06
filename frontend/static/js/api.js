@@ -1,3 +1,4 @@
+// chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-fd71c9072644cabd20e39b57bf2d47b25107e752/frontend/static/js/api.js
 // static/js/api.js
 
 // Determine the base URL for the API
@@ -32,7 +33,7 @@ function sendHeartbeat(token) {
 
 
 /**
- * Constructs the URL for fetching historical data.
+ * Constructs the URL for fetching the initial set of historical data.
  * @param {string} sessionToken - The unique session token for the user.
  * @param {string} exchange - The exchange name.
  * @param {string} token - The asset symbol/token.
@@ -53,8 +54,18 @@ function getHistoricalDataUrl(sessionToken, exchange, token, interval, startTime
     return `${API_BASE_URL}/historical/?${params.toString()}`;
 }
 
-// You can add more functions here for other API endpoints as needed
-// Example:
-// function getSomeOtherDataUrl(params) {
-//     return `${API_BASE_URL}/other-endpoint/?${new URLSearchParams(params).toString()}`;
-// }
+/**
+ * Constructs the URL for fetching a subsequent chunk of historical data.
+ * @param {string} requestId - The unique ID for the data request session.
+ * @param {number} offset - The starting index of the data to fetch.
+ * @param {number} [limit=5000] - The number of data points to fetch.
+ * @returns {string} The full API URL for the data chunk.
+ */
+function getHistoricalDataChunkUrl(requestId, offset, limit = 5000) {
+    const params = new URLSearchParams({
+        request_id: requestId,
+        offset: offset,
+        limit: limit
+    });
+    return `${API_BASE_URL}/historical/chunk?${params.toString()}`;
+}

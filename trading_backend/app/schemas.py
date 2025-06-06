@@ -1,3 +1,4 @@
+# chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-fd71c9072644cabd20e39b57bf2d47b25107e752/trading_backend/app/schemas.py
 from pydantic import BaseModel, Field, model_validator 
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -95,10 +96,18 @@ class HistoricalDataResponse(BaseModel):
     Defines the structured response for historical data requests.
     Includes the candle data plus metadata about the load.
     """
+    request_id: Optional[str] = Field(None, description="A unique ID for this data request, used for fetching subsequent chunks.")
     candles: List[Candle] = Field(description="The list of OHLC candle data.")
+    offset: Optional[int] = Field(None, description="The starting offset of this chunk within the full dataset.")
     total_available: int = Field(description="The total number of candles available on the server for the requested range.")
     is_partial: bool = Field(description="True if the returned 'candles' are a subset of the total available (due to size limit).")
     message: str = Field(description="A message describing the result of the data load.")
+
+class HistoricalDataChunkResponse(BaseModel):
+    candles: List[Candle]
+    offset: int
+    limit: int
+    total_available: int
 
 class SessionInfo(BaseModel):
     session_token: str
