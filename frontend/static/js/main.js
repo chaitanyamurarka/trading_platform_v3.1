@@ -1,3 +1,4 @@
+// chaitanyamurarka/trading_platform_v3.1/trading_platform_v3.1-66a7995b817d40714564deabfdf0ca0ce8992874/frontend/static/js/main.js
 document.addEventListener('DOMContentLoaded', () => {
     const chartContainer = document.getElementById('chartContainer');
     const loadChartBtn = document.getElementById('loadChartBtn');
@@ -14,6 +15,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let allVolumeData = [];
     let currentlyFetching = false;
     let oldestDataTimestamp = null;
+    let allDataLoaded = false; // Flag to track if all data is loaded
 
     let mainChart = null;
     let candleSeries = null;
@@ -98,47 +100,59 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         mainChart.priceScale('').applyOptions({ scaleMargins: { top: 0.7, bottom: 0 } });
 
-        // Add the event listener for lazy loading
         mainChart.timeScale().subscribeVisibleLogicalRangeChange(async (newVisibleRange) => {
-            // Disable lazy loading for intervals greater than 1 minute
-            const lazyLoadIntervals = ['1s', '5s', '10s', '15s', '30s', '45s', '1m'];
-            if (!lazyLoadIntervals.includes(intervalSelect.value)) {
+            if (!newVisibleRange) {
                 return;
             }
 
-            if (currentlyFetching || !oldestDataTimestamp || !newVisibleRange) {
+            // =================== FIX START ===================
+            // If all data is loaded, prevent scrolling before the first bar (index 0)
+            if (allDataLoaded && newVisibleRange.from < 0) {
+                // This new logic prevents the jarring snap to the beginning.
+                // It preserves the user's zoom level and just stops the scroll at the boundary.
+                const currentRange = mainChart.timeScale().getVisibleLogicalRange();
+                if (currentRange) {
+                    const rangeWidth = currentRange.to - currentRange.from;
+                    mainChart.timeScale().setVisibleLogicalRange({
+                        from: 0,
+                        to: rangeWidth,
+                    });
+                }
+                return;
+            }
+            // =================== FIX END ===================
+
+            if (currentlyFetching || !oldestDataTimestamp || allDataLoaded) {
                 return;
             }
 
-            // Dynamically determine the scroll threshold to trigger lazy loading.
-            // Trigger when user scrolls to the first 5% of the loaded data, with a minimum of 50 bars.
             const lazyLoadThreshold = Math.max(50, Math.floor(allChartData.length * 0.05));
 
             if (newVisibleRange.from < lazyLoadThreshold) { 
                 const userSelectedStartDate = new Date(startTimeInput.value);
                 const currentOldestDate = new Date(oldestDataTimestamp * 1000);
 
-                // Stop if we have already loaded data up to the user's selected start time
                 if (currentOldestDate <= userSelectedStartDate) {
-                    console.log("All historical data loaded.");
+                    allDataLoaded = true;
                     return;
                 }
                 
-                // Define the next chunk to fetch (e.g., another 5 days)
-                const nextEndDate = new Date(currentOldestDate);
-                const nextStartDate = new Date(nextEndDate);
-                nextStartDate.setDate(nextEndDate.getDate() - 5); // Fetch previous 5 days
+                const nextStartTime = userSelectedStartDate;
+                const nextEndTime = new Date(currentOldestDate.getTime() - 1000);
 
-                const finalNextStartDate = nextStartDate < userSelectedStartDate ? userSelectedStartDate : nextStartDate;
 
-                const nextStartTimeStr = finalNextStartDate.toISOString().slice(0, 16);
-                const nextEndTimeStr = nextEndDate.toISOString().slice(0, 16);
+                if (nextStartTime >= nextEndTime) {
+                    allDataLoaded = true;
+                    return;
+                }
+
+                const nextStartTimeStr = nextStartTime.toISOString().slice(0, 16);
+                const nextEndTimeStr = nextEndTime.toISOString().slice(0, 16);
                 
                 showToast('Loading older data...', 'info');
                 await fetchAndApplyData(nextStartTimeStr, nextEndTimeStr, true);
             }
         });
-
     }
 
     async function fetchAndApplyData(startTime, endTime, prepending = false) {
@@ -153,7 +167,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const token = symbolSelect.value;
         const interval = intervalSelect.value;
 
-        // Ensure seconds are added if not present
         if (startTime.length === 16) startTime += ':00';
         if (endTime.length === 16) endTime += ':00';
 
@@ -165,33 +178,47 @@ document.addEventListener('DOMContentLoaded', () => {
                 const errorData = await response.json().catch(() => ({ detail: response.statusText }));
                 throw new Error(`HTTP error ${response.status}: ${errorData.detail || 'Failed to fetch data'}`);
             }
-            const data = await response.json();
+            
+            const responseData = await response.json();
 
-            if (!Array.isArray(data) || data.length === 0) {
-                showToast('No more historical data available for this range.', 'info');
+            if (!responseData || !Array.isArray(responseData.candles) || responseData.candles.length === 0) {
+                const message = responseData.message || 'No historical data available for this range.';
+                showToast(message, 'info');
+                if (prepending) {
+                    console.log("Lazy loading complete: No more older candles returned.");
+                    allDataLoaded = true;
+                }
                 return;
             }
 
-            const chartFormattedData = data.map(item => ({
+            if (prepending && !responseData.is_partial) {
+                console.log("Lazy loading complete: Server indicated end of data.");
+                allDataLoaded = true;
+            }
+
+            const candleData = responseData.candles;
+            const chartFormattedData = candleData.map(item => ({
                 time: item.unix_timestamp, open: item.open, high: item.high, low: item.low, close: item.close,
             }));
-            const volumeFormattedData = data.map(item => ({
+            const volumeFormattedData = candleData.map(item => ({
                 time: item.unix_timestamp, value: item.volume,
                 color: item.close > item.open ? 'rgba(16, 185, 129, 0.5)' : 'rgba(239, 68, 68, 0.5)',
             }));
 
             if (prepending) {
-                // Prepend new (older) data to existing data
                 allChartData = [...chartFormattedData, ...allChartData];
                 allVolumeData = [...volumeFormattedData, ...allVolumeData];
             } else {
-                // Initial load
                 allChartData = chartFormattedData;
                 allVolumeData = volumeFormattedData;
+                if (!responseData.is_partial) {
+                    allDataLoaded = true;
+                }
             }
             
-            // The oldest timestamp is the first item in the newly fetched chunk
-            oldestDataTimestamp = chartFormattedData[0].time;
+            if(chartFormattedData.length > 0) {
+                oldestDataTimestamp = chartFormattedData[0].time;
+            }
 
             if (candleSeries) candleSeries.setData(allChartData);
             if (volumeSeries) volumeSeries.setData(allVolumeData);
@@ -199,16 +226,16 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!prepending) {
                 const dataSize = allChartData.length;
                 if (dataSize > 0) {
-                    const numberOfBarsToShow = 100; // You can adjust this number
+                    const numberOfBarsToShow = 100;
                     const visibleFrom = Math.max(0, dataSize - numberOfBarsToShow);
                     const visibleTo = dataSize - 1;
                     mainChart.timeScale().setVisibleLogicalRange({ from: visibleFrom, to: visibleTo });
                 } else {
-                    mainChart.timeScale().fitContent(); // Fallback for no data
+                    mainChart.timeScale().fitContent();
                 }
             }
 
-            updateDataSummary(allChartData[allChartData.length - 1], token, exchange, interval);
+            updateDataSummary(allChartData.length > 0 ? allChartData[allChartData.length - 1] : null, token, exchange, interval);
             showToast(`Chart data loaded. Total points: ${allChartData.length}`, 'success');
 
         } catch (error) {
@@ -229,11 +256,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const change = latestData.close - latestData.open;
         const changePercent = (latestData.open === 0) ? 0 : (change / latestData.open) * 100;
         const changeClass = change >= 0 ? 'text-success' : 'text-error';
-        const dateObj = new Date(latestData.unix_timestamp * 1000);
+        const dateObj = new Date(latestData.time * 1000);
         const formattedDate = `${dateObj.getDate().toString().padStart(2, '0')}/${(dateObj.getMonth() + 1).toString().padStart(2, '0')}/${dateObj.getFullYear()} ${dateObj.getHours().toString().padStart(2, '0')}:${dateObj.getMinutes().toString().padStart(2, '0')}:${dateObj.getSeconds().toString().padStart(2, '0')}`;
+        const lastVolumeData = allVolumeData.find(d => d.time === latestData.time);
+        const volume = lastVolumeData ? lastVolumeData.value : 'N/A';
         dataSummaryElement.innerHTML = `
             <strong>${symbol} (${exchange}) - ${interval}</strong><br>
-            Last: O: ${latestData.open.toFixed(2)} H: ${latestData.high.toFixed(2)} L: ${latestData.low.toFixed(2)} C: ${latestData.close.toFixed(2)} V: ${latestData.volume ? latestData.volume.toLocaleString() : 'N/A'}<br>
+            Last: O: ${latestData.open.toFixed(2)} H: ${latestData.high.toFixed(2)} L: ${latestData.low.toFixed(2)} C: ${latestData.close.toFixed(2)} V: ${volume ? volume.toLocaleString() : 'N/A'}<br>
             Change: <span class="${changeClass}">${change.toFixed(2)} (${changePercent.toFixed(2)}%)</span><br>
             Time: ${formattedDate}
         `;
@@ -285,44 +314,25 @@ document.addEventListener('DOMContentLoaded', () => {
             setTimeout(() => toast.remove(), 500);
         }, 3000);
     }
+    
     async function loadInitialChart() {
         if (!sessionToken) {
             showToast('Waiting for session to start...', 'info');
             return;
         }
 
-        let startTimeStr = startTimeInput.value;
-        let endTimeStr = endTimeInput.value;
+        const startTimeStr = startTimeInput.value;
+        const endTimeStr = endTimeInput.value;
 
         if (!startTimeStr || !endTimeStr) {
             showToast('Start Time and End Time are required.', 'error');
             return;
         }
         
-        // Reset state for a new chart load
+        allDataLoaded = false;
         allChartData = [];
         allVolumeData = [];
         oldestDataTimestamp = null;
-
-
-        const intervalValue = intervalSelect.value;
-        const lazyLoadIntervals = ['1s', '5s', '10s', '15s', '30s', '45s', '1m'];
-
-        if (lazyLoadIntervals.includes(intervalValue)) {
-            // For intervals that use lazy loading, grab the last 24 hours of the selected period for the initial load.
-            const endDate = new Date(endTimeStr);
-            const initialStartDate = new Date(endDate);
-            initialStartDate.setDate(endDate.getDate() - 1); // Fetch last 1 day
-
-            // Make sure the initial start date doesn't go earlier than the user's selected start time
-            const userStartDate = new Date(startTimeStr);
-            if (initialStartDate < userStartDate) {
-                startTimeStr = userStartDate.toISOString().slice(0, 16);
-            } else {
-                startTimeStr = initialStartDate.toISOString().slice(0, 16);
-            }
-        }
-        // For intervals > 1m, we fetch the whole selected range, so we don't modify startTimeStr.
 
         await fetchAndApplyData(startTimeStr, endTimeStr, false);
     }
