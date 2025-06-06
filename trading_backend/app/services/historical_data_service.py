@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, date as datetime_date, timezone
 from typing import List, Optional ,Dict# Ensure Optional is imported if not already
 from app.core.numba_resampling_kernels import launch_resample_ohlc # Your Numba/CUDA launcher
 from .. import schemas, models
-from ..core.cache import get_cached_ohlc_data, set_cached_ohlc_data, build_ohlc_cache_key
+from ..core.cache import get_cached_ohlc_data, set_cached_ohlc_data, build_ohlc_cache_key, redis_client
 from ..dtn_iq_client import get_iqfeed_history_conn # NEW IMPORT
 import logging
 import numpy as np
@@ -380,8 +380,8 @@ def get_initial_historical_data(
     request_id_for_chunks = target_data_key
 
     if not full_data:
-        # 2. Cache MISS. We need to process from 1s data.
-        logging.info(f"Cache MISS for {target_data_key}. Processing from 1s data.")
+        # 2. Cache MISS for the target interval. Process from base 1s data.
+        logging.info(f"Cache MISS for {target_data_key}. Processing from base 1s data.")
         
         base_1s_candles = _get_and_prepare_1s_data_for_range(
             background_tasks, session_token, exchange, token, start_time, end_time
@@ -390,20 +390,29 @@ def get_initial_historical_data(
         if not base_1s_candles:
             return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.", request_id=None, offset=None)
 
-        # Resample ON-DEMAND for the user's currently requested interval
+        # Convert to full `Candle` schema for caching and processing
+        full_1s_data = [schemas.Candle(**c.model_dump()) for c in base_1s_candles]
+
+        # FIX: Always cache the full 1s data for the range, so subsequent 1s requests are fast.
+        full_1s_cache_key = f"{request_range_id}:1s"
+        set_cached_ohlc_data(full_1s_cache_key, full_1s_data, expiration=3600)
+        logging.info(f"Base '1s' data cached for the full range under key: {full_1s_cache_key}")
+
+        # Now, determine the data to return to the user
         if interval_val == "1s":
-            full_data = [schemas.Candle(**c.model_dump()) for c in base_1s_candles]
+            full_data = full_1s_data
         else:
+            # Resample the 1s data if a different interval was requested
             aggregation_seconds = INTERVAL_SECONDS_MAP.get(interval_val)
             if not aggregation_seconds:
                 raise HTTPException(status_code=400, detail=f"Unsupported interval for resampling: {interval_val}")
 
-            timestamps_1s_np = np.array([c.timestamp.replace(tzinfo=timezone.utc).timestamp() for c in base_1s_candles], dtype=np.float64)
-            open_1s_np = np.array([c.open for c in base_1s_candles], dtype=np.float64)
-            high_1s_np = np.array([c.high for c in base_1s_candles], dtype=np.float64)
-            low_1s_np = np.array([c.low for c in base_1s_candles], dtype=np.float64)
-            close_1s_np = np.array([c.close for c in base_1s_candles], dtype=np.float64)
-            volume_1s_np = np.array([c.volume if c.volume is not None else 0.0 for c in base_1s_candles], dtype=np.float64)
+            timestamps_1s_np = np.array([c.timestamp.replace(tzinfo=timezone.utc).timestamp() for c in full_1s_data], dtype=np.float64)
+            open_1s_np = np.array([c.open for c in full_1s_data], dtype=np.float64)
+            high_1s_np = np.array([c.high for c in full_1s_data], dtype=np.float64)
+            low_1s_np = np.array([c.low for c in full_1s_data], dtype=np.float64)
+            close_1s_np = np.array([c.close for c in full_1s_data], dtype=np.float64)
+            volume_1s_np = np.array([c.volume if c.volume is not None else 0.0 for c in full_1s_data], dtype=np.float64)
             
             (ts_agg, o_agg, h_agg, l_agg, c_agg, v_agg, num_agg_bars) = launch_resample_ohlc(
                 timestamps_1s_np, open_1s_np, high_1s_np, low_1s_np, close_1s_np, volume_1s_np,
@@ -421,18 +430,27 @@ def get_initial_historical_data(
         if not full_data:
              return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="Data processing yielded no results.", request_id=None, offset=None)
 
-        set_cached_ohlc_data(target_data_key, full_data, expiration=3600)
+        # Cache the data for the interval the user actually requested (if it wasn't 1s)
+        if interval_val != "1s":
+            set_cached_ohlc_data(target_data_key, full_data, expiration=3600)
+            logging.info(f"On-demand data for interval '{interval_val}' cached under key: {target_data_key}")
         
-        # 3. Trigger the background task to pre-aggregate ALL OTHER intervals
-        base_1s_data_key_for_task = f"temp_1s_data:{uuid.uuid4()}"
-        set_cached_ohlc_data(base_1s_data_key_for_task, base_1s_candles, expiration=600)
+        # 3. FIX: Trigger the background task only once using a Redis flag
+        task_triggered_key = f"{request_range_id}:task_triggered"
+        if redis_client.get(task_triggered_key) is None:
+            base_1s_data_key_for_task = f"temp_1s_data:{uuid.uuid4()}"
+            set_cached_ohlc_data(base_1s_data_key_for_task, base_1s_candles, expiration=600)
 
-        logging.info(f"Adding Celery task to pre-aggregate all intervals for range: {request_range_id}")
-        resample_and_cache_all_intervals_task.delay(
-            base_1s_data_key=base_1s_data_key_for_task,
-            request_id_prefix=request_range_id,
-            user_requested_interval=interval_val
-        )
+            logging.info(f"Adding Celery task to pre-aggregate all other intervals for range: {request_range_id}")
+            resample_and_cache_all_intervals_task.delay(
+                base_1s_data_key=base_1s_data_key_for_task,
+                request_id_prefix=request_range_id,
+                user_requested_interval=interval_val
+            )
+            # Set the flag to prevent re-triggering for this range.
+            redis_client.set(task_triggered_key, "true", ex=3600)
+        else:
+            logging.info(f"Background pre-aggregation task for range {request_range_id} was already triggered. Skipping.")
 
     # 4. Prepare and return the response chunk
     total_available = len(full_data)
