@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]  # For the ASGI server
+sqlalchemy         # ORM for database interaction
+pydantic           # For data validation and settings management
+python-dotenv      # For managing environment variables
+pymysql            # MySQL driver (or mysqlclient)
+redis              # For Redis client
+celery             # For task queue
+passlib[bcrypt]    # For password hashing (if you plan auth soon)
+python-jose[cryptography] # For JWT tokens (if you plan auth soon)
+pydantic_settings
+NorenRestApi
+pyotp
+eventlet
+numba
+pywin32
