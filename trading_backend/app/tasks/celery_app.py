@@ -1,4 +1,7 @@
 # app/tasks/celery_app.py
+import eventlet
+eventlet.monkey_patch() # <-- Add this line at the very top
+
 from celery import Celery
 from ..config import settings # Your application settings
 
@@ -11,7 +14,8 @@ celery_application = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     include=['app.tasks.optimization_tasks',
-             'app.tasks.cache_cleanup_tasks'] # List of modules to import when the worker starts
+             'app.tasks.cache_cleanup_tasks',
+             'app.tasks.data_processing_tasks'] # Added the new task module
 )
 
 # Optional Celery configuration

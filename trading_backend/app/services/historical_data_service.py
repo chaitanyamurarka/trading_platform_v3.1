@@ -18,6 +18,7 @@ from pydantic import TypeAdapter # Added for bulk Pydantic model creation
 from fastapi import BackgroundTasks,HTTPException # Add this import
 from sqlalchemy import text # Add for raw SQL if needed for other parts, though CRUD should handle most
 import uuid
+from ..tasks.data_processing_tasks import resample_and_cache_all_intervals_task
 
 # import time # time module was imported but not used in the provided file, can be removed if not needed elsewhere
 def map_interval_to_iqfeed_params(interval_val: str) -> Optional[Dict[str, any]]:
@@ -367,24 +368,79 @@ def get_initial_historical_data(
     limit: int = 5000
 ) -> schemas.HistoricalDataResponse:
     
-    request_id = _process_and_cache_full_data(
-        background_tasks, session_token, exchange, token, interval_val, start_time, end_time
-    )
+    # Define a unique prefix for this query range, independent of interval
+    request_range_id = f"chart_data_full:{session_token}:{exchange}:{token}:{start_time.isoformat()}:{end_time.isoformat()}"
+    
+    # Define the specific cache key for the requested interval
+    target_data_key = f"{request_range_id}:{interval_val}"
 
-    if not request_id:
-        return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.", request_id=None, offset=None)
+    # 1. Check if pre-aggregated data for this specific interval already exists
+    full_data = get_cached_ohlc_data(target_data_key)
+    
+    request_id_for_chunks = target_data_key
 
-    full_data = get_cached_ohlc_data(request_id)
     if not full_data:
-        return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="Error retrieving processed data from cache.", request_id=request_id, offset=None)
+        # 2. Cache MISS. We need to process from 1s data.
+        logging.info(f"Cache MISS for {target_data_key}. Processing from 1s data.")
         
+        base_1s_candles = _get_and_prepare_1s_data_for_range(
+            background_tasks, session_token, exchange, token, start_time, end_time
+        )
+
+        if not base_1s_candles:
+            return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="No data available for the selected range.", request_id=None, offset=None)
+
+        # Resample ON-DEMAND for the user's currently requested interval
+        if interval_val == "1s":
+            full_data = [schemas.Candle(**c.model_dump()) for c in base_1s_candles]
+        else:
+            aggregation_seconds = INTERVAL_SECONDS_MAP.get(interval_val)
+            if not aggregation_seconds:
+                raise HTTPException(status_code=400, detail=f"Unsupported interval for resampling: {interval_val}")
+
+            timestamps_1s_np = np.array([c.timestamp.replace(tzinfo=timezone.utc).timestamp() for c in base_1s_candles], dtype=np.float64)
+            open_1s_np = np.array([c.open for c in base_1s_candles], dtype=np.float64)
+            high_1s_np = np.array([c.high for c in base_1s_candles], dtype=np.float64)
+            low_1s_np = np.array([c.low for c in base_1s_candles], dtype=np.float64)
+            close_1s_np = np.array([c.close for c in base_1s_candles], dtype=np.float64)
+            volume_1s_np = np.array([c.volume if c.volume is not None else 0.0 for c in base_1s_candles], dtype=np.float64)
+            
+            (ts_agg, o_agg, h_agg, l_agg, c_agg, v_agg, num_agg_bars) = launch_resample_ohlc(
+                timestamps_1s_np, open_1s_np, high_1s_np, low_1s_np, close_1s_np, volume_1s_np,
+                aggregation_seconds
+            )
+
+            resampled_candles = []
+            for i in range(num_agg_bars):
+                agg_dt = datetime.fromtimestamp(ts_agg[i], tz=timezone.utc)
+                resampled_candles.append(schemas.Candle(
+                    timestamp=agg_dt, open=o_agg[i], high=h_agg[i], low=l_agg[i], close=c_agg[i], volume=v_agg[i]
+                ))
+            full_data = resampled_candles
+
+        if not full_data:
+             return schemas.HistoricalDataResponse(candles=[], total_available=0, is_partial=False, message="Data processing yielded no results.", request_id=None, offset=None)
+
+        set_cached_ohlc_data(target_data_key, full_data, expiration=3600)
+        
+        # 3. Trigger the background task to pre-aggregate ALL OTHER intervals
+        base_1s_data_key_for_task = f"temp_1s_data:{uuid.uuid4()}"
+        set_cached_ohlc_data(base_1s_data_key_for_task, base_1s_candles, expiration=600)
+
+        logging.info(f"Adding Celery task to pre-aggregate all intervals for range: {request_range_id}")
+        resample_and_cache_all_intervals_task.delay(
+            base_1s_data_key=base_1s_data_key_for_task,
+            request_id_prefix=request_range_id,
+            user_requested_interval=interval_val
+        )
+
+    # 4. Prepare and return the response chunk
     total_available = len(full_data)
     initial_offset = max(0, total_available - limit)
-    
     candles_to_send = full_data[initial_offset:] 
     
     return schemas.HistoricalDataResponse(
-        request_id=request_id,
+        request_id=request_id_for_chunks,
         candles=candles_to_send,
         offset=initial_offset,
         total_available=total_available,
@@ -398,7 +454,7 @@ def get_historical_data_chunk(
     limit: int = 5000
 ) -> schemas.HistoricalDataChunkResponse:
     
-    if not request_id.startswith("chart_data:"):
+    if not request_id.startswith("chart_data_full:"):
         raise HTTPException(status_code=400, detail="Invalid request_id format.")
 
     full_data = get_cached_ohlc_data(request_id)
