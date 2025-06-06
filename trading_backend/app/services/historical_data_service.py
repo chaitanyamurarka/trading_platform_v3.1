@@ -219,7 +219,7 @@ def _get_and_prepare_1s_data_for_range(
     Orchestrates fetching 1s data using a day-by-day caching strategy.
     - Checks cache for each day in the requested range.
     - Fetches any missing days from the DTN API in a single consolidated request.
-    - Caches the newly fetched data by day.
+    - Caches the newly fetched data by day. If a day has no data, it's cached as an empty result.
     - Combines all data and filters to the precise start/end time.
     """
     all_1s_candles = []
@@ -244,7 +244,9 @@ def _get_and_prepare_1s_data_for_range(
             logging.info(f"Cache hit for 1s data on {date_range[i].date()}")
             try:
                 deserialized = json.loads(result)
-                all_1s_candles.extend([schemas.CandleBase(**item) for item in deserialized])
+                # Ensure we don't extend with an empty marker if that's what was cached
+                if deserialized:
+                    all_1s_candles.extend([schemas.CandleBase(**item) for item in deserialized])
             except (json.JSONDecodeError, TypeError):
                 logging.warning(f"Could not parse cached 1s data for {date_range[i].date()}. Refetching.")
                 missing_dates.append(date_range[i].date())
@@ -272,31 +274,41 @@ def _get_and_prepare_1s_data_for_range(
             end_time=fetch_end_time
         )
         
+        # Start a new pipeline for caching the results
+        pipe = redis_client.pipeline()
+
+        # Group fetched data by date string for efficient lookup
+        grouped_new_data = {}
         if newly_fetched_data:
-            # Add newly fetched data to our main list
             all_1s_candles.extend(newly_fetched_data)
-            
-            # Group the new data by day and cache it
             new_data_df = pd.DataFrame([c.model_dump() for c in newly_fetched_data])
             if not new_data_df.empty:
                 new_data_df['timestamp'] = pd.to_datetime(new_data_df['timestamp'])
                 new_data_df['date_key'] = new_data_df['timestamp'].dt.strftime('%Y-%m-%d')
+                grouped_new_data = {date_key: group for date_key, group in new_data_df.groupby('date_key')}
+
+        # Iterate through all dates we attempted to fetch to update the cache
+        for day in missing_dates:
+            date_str = day.strftime('%Y-%m-%d')
+            day_cache_key = build_ohlc_cache_key(exchange, token, "1s", date_str, session_token=session_token)
+            
+            if date_str in grouped_new_data:
+                # Data was found for this day, cache it
+                group = grouped_new_data[date_str]
+                serializable_group = group.to_dict(orient='records')
+                for record in serializable_group:
+                    if isinstance(record['timestamp'], pd.Timestamp):
+                        record['timestamp'] = record['timestamp'].to_pydatetime().isoformat()
                 
-                pipe = redis_client.pipeline()
-                for date_key, group in new_data_df.groupby('date_key'):
-                    day_cache_key = build_ohlc_cache_key(exchange, token, "1s", date_key, session_token=session_token)
-                    
-                    # Convert Pydantic models to dicts for JSON serialization
-                    serializable_group = group.to_dict(orient='records')
-                    
-                    # Ensure timestamp is in ISO format for JSON
-                    for record in serializable_group:
-                        if isinstance(record['timestamp'], pd.Timestamp):
-                            record['timestamp'] = record['timestamp'].to_pydatetime().isoformat()
-                    
-                    pipe.set(day_cache_key, json.dumps(serializable_group), ex=CACHE_EXPIRATION_SECONDS)
-                    logging.info(f"Caching {len(group)} 1s records for date {date_key}")
-                pipe.execute()
+                pipe.set(day_cache_key, json.dumps(serializable_group), ex=CACHE_EXPIRATION_SECONDS)
+                logging.info(f"Caching {len(group)} 1s records for date {date_str}")
+            else:
+                # No data was found for this specific day, cache an empty marker
+                pipe.set(day_cache_key, json.dumps([]), ex=CACHE_EXPIRATION_SECONDS)
+                logging.info(f"Caching empty result for date {date_str} as no data was returned.")
+        
+        # Execute all caching operations at once
+        pipe.execute()
 
     # Sort all candles by timestamp to ensure correct order before filtering
     all_1s_candles.sort(key=lambda c: c.timestamp)
@@ -311,7 +323,6 @@ def _get_and_prepare_1s_data_for_range(
     ]
 
     return final_filtered_candles
-
 
 # Make sure the original get_historical_data_with_fetch function is here,
 # as it calls the reworked helper function above. Its code does not need to change.
