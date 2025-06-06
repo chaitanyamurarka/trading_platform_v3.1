@@ -90,5 +90,15 @@ class JobSubmissionResponse(BaseModel):
     status: JobStatus = JobStatus.RECEIVED # Initial status
     message: Optional[str] = "Job submitted successfully."
 
+class HistoricalDataResponse(BaseModel):
+    """
+    Defines the structured response for historical data requests.
+    Includes the candle data plus metadata about the load.
+    """
+    candles: List[Candle] = Field(description="The list of OHLC candle data.")
+    total_available: int = Field(description="The total number of candles available on the server for the requested range.")
+    is_partial: bool = Field(description="True if the returned 'candles' are a subset of the total available (due to size limit).")
+    message: str = Field(description="A message describing the result of the data load.")
+
 class SessionInfo(BaseModel):
     session_token: str
